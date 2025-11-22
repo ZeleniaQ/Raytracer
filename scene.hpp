@@ -1,4 +1,3 @@
-// scene.hpp — scene parser and storage (camera, suns, bulbs, xyz/tri, plane/sphere)
 #ifndef SCENE_HPP
 #define SCENE_HPP
 
@@ -7,45 +6,57 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <unordered_map>
 #include <algorithm>
 
 #include "sphere.hpp"
 #include "plane.hpp"
-#include "triangle.hpp"   // for xyz / tri
+#include "triangle.hpp"
+#include "texture.hpp"
 
-struct Sun  { Vec3 dir; Vec3 color; };   // directional light: L = normalize(dir) 指向光源
-struct Bulb { Vec3 pos; Vec3 color; };   // point light: 1/d^2 衰减
+struct Sun { Vec3 dir; Vec3 color; };
+struct Bulb{ Vec3 pos; Vec3 color; };
 
 class Scene {
 public:
-    // output
-    int width = 0, height = 0;
+    int width=0, height=0;
     std::string filename;
 
-    // camera state
-    Vec3 eye     = Vec3(0,0,0);
-    Vec3 forward = Vec3(0,0,-1);   // 不归一化：长度控制缩放
+    // camera (保持之前版本)
+    Vec3 eye = Vec3(0,0,0);
+    Vec3 forward = Vec3(0,0,-1);
     Vec3 up_hint = Vec3(0,1,0);
 
-    // render params
-    int bounces    = 4;            // 反射/折射递归深度（预留）
-    int aa_samples = 1;            // 抗锯齿采样数
+    int bounces=4;
+    int aa_samples=1;
 
-    // state machine color for subsequent primitives/lights
     Vec3 current_color = Vec3(1,1,1);
 
-    // scene content
-    std::vector<std::shared_ptr<Object>> objects; // spheres / planes / triangles ...
-    std::vector<Sun>  suns;                       // 方向光（允许多个）
-    std::vector<Bulb> bulbs;                      // 点光
+    // --- texture state & cache ---
+    std::shared_ptr<Texture> current_tex = nullptr;  // texture state (none by default)
+    std::unordered_map<std::string, std::shared_ptr<Texture>> tex_cache;
 
-    // xyz vertex pool for tri
+    // xyz pool (positions + uvs for tri)
     std::vector<Vec3> xyz_vertices;
+    std::vector<std::pair<double,double>> xyz_uvs;   // captured texcoord at xyz time
+    double cur_u = 0.0, cur_v = 0.0;                 // current texcoord state
+
+    std::vector<std::shared_ptr<Object>> objects;
+    std::vector<Sun>  suns;
+    std::vector<Bulb> bulbs;
+
+    std::shared_ptr<Texture> getTexture(const std::string& path) {
+        auto it = tex_cache.find(path);
+        if (it != tex_cache.end()) return it->second;
+        auto t = std::make_shared<Texture>();
+        if (!t->load(path)) return nullptr;
+        tex_cache[path] = t;
+        return t;
+    }
 
     bool loadFromFile(const std::string& path) {
         std::ifstream file(path);
         if (!file) return false;
-
         std::string line;
         while (std::getline(file, line)) {
             if (line.empty()) continue;
@@ -57,21 +68,53 @@ public:
                 iss >> width >> height >> filename;
 
             } else if (cmd == "color") {
-                double r,g,b; iss >> r >> g >> b;
-                current_color = Vec3(r,g,b);
+                double r,g,b; iss >> r >> g >> b; current_color = Vec3(r,g,b);
+
+            } else if (cmd == "texture") {
+                std::string name; iss >> name;
+                if (name == "none") current_tex = nullptr;
+                else current_tex = getTexture(name);
+
+            } else if (cmd == "texcoord") {
+                iss >> cur_u >> cur_v; // captured by subsequent xyz
+
+            } else if (cmd == "xyz") {
+                double x,y,z; iss >> x >> y >> z;
+                xyz_vertices.emplace_back(x,y,z);
+                xyz_uvs.emplace_back(cur_u, cur_v); // capture current texcoord
+
+            } else if (cmd == "tri") {
+                auto resolveIndex = [&](int idx)->int{
+                    if (idx>0) return idx-1;
+                    return (int)xyz_vertices.size() + idx; // negative from back
+                };
+                int i,j,k; iss >> i >> j >> k;
+                int ia=resolveIndex(i), ib=resolveIndex(j), ic=resolveIndex(k);
+                if (ia>=0 && ib>=0 && ic>=0 &&
+                    ia<(int)xyz_vertices.size() &&
+                    ib<(int)xyz_vertices.size() &&
+                    ic<(int)xyz_vertices.size()) {
+                    auto [ua,va] = xyz_uvs[ia];
+                    auto [ub,vb] = xyz_uvs[ib];
+                    auto [uc,vc] = xyz_uvs[ic];
+                    objects.emplace_back(std::make_shared<Triangle>(
+                        xyz_vertices[ia], xyz_vertices[ib], xyz_vertices[ic],
+                        current_color, ua,va, ub,vb, uc,vc, current_tex
+                    ));
+                }
 
             } else if (cmd == "sphere") {
                 double x,y,z,r; iss >> x >> y >> z >> r;
-                objects.emplace_back(std::make_shared<Sphere>(Vec3(x,y,z), r, current_color));
+                objects.emplace_back(std::make_shared<Sphere>(
+                    Vec3(x,y,z), r, current_color, current_tex));
 
             } else if (cmd == "plane") {
-                // plane A B C D  ->  Ax + By + Cz + D = 0
                 double A,B,C,D; iss >> A >> B >> C >> D;
                 objects.emplace_back(std::make_shared<Plane>(A,B,C,D, current_color));
 
             } else if (cmd == "sun") {
                 double x,y,z; iss >> x >> y >> z;
-                suns.push_back(Sun{ Vec3(x,y,z), current_color }); // dir=指向光源
+                suns.push_back(Sun{ Vec3(x,y,z), current_color });
 
             } else if (cmd == "bulb") {
                 double x,y,z; iss >> x >> y >> z;
@@ -79,50 +122,18 @@ public:
 
             } else if (cmd == "eye") {
                 double x,y,z; iss >> x >> y >> z; eye = Vec3(x,y,z);
-
             } else if (cmd == "forward") {
                 double x,y,z; iss >> x >> y >> z; forward = Vec3(x,y,z);
-
             } else if (cmd == "up") {
                 double x,y,z; iss >> x >> y >> z; up_hint = Vec3(x,y,z);
-
             } else if (cmd == "aa") {
                 int n; iss >> n; aa_samples = std::max(1, n);
-
             } else if (cmd == "bounces") {
                 int d; iss >> d; bounces = std::max(0, d);
-
-            } else if (cmd == "xyz") {
-                // store vertex position only; material captured at tri-time
-                double x,y,z; iss >> x >> y >> z;
-                xyz_vertices.emplace_back(x,y,z);
-
-            } else if (cmd == "tri") {
-                // 1-based indices; negative indices count from the back
-                auto resolveIndex = [&](int idx)->int {
-                    if (idx > 0) return idx - 1;                // 1..N -> 0..N-1
-                    return int(xyz_vertices.size()) + idx;      // -1 -> last, etc.
-                };
-                int i,j,k; iss >> i >> j >> k;
-                int ia = resolveIndex(i);
-                int ib = resolveIndex(j);
-                int ic = resolveIndex(k);
-                if (ia >= 0 && ib >= 0 && ic >= 0 &&
-                    ia < int(xyz_vertices.size()) &&
-                    ib < int(xyz_vertices.size()) &&
-                    ic < int(xyz_vertices.size()))
-                {
-                    objects.emplace_back(std::make_shared<Triangle>(
-                        xyz_vertices[ia], xyz_vertices[ib], xyz_vertices[ic],
-                        current_color   // capture material at tri invocation
-                    ));
-                }
-                // 若索引非法：静默忽略该三角（也可打印警告）
-
-            } // end command branches
+            }
         }
         return true;
     }
 };
 
-#endif // SCENE_HPP
+#endif
